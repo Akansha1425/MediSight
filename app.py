@@ -12,20 +12,6 @@ import cv2
 st.set_page_config(page_title="MediSight AI", layout="wide")
 
 # =========================
-# CUSTOM CSS
-# =========================
-st.markdown("""
-<style>
-.card {
-    background: rgba(255,255,255,0.05);
-    padding: 20px;
-    border-radius: 15px;
-    backdrop-filter: blur(10px);
-}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================
 # SIDEBAR
 # =========================
 st.sidebar.title("🩺 MediSight AI")
@@ -57,12 +43,47 @@ transform = transforms.Compose([
                          [0.229,0.224,0.225])
 ])
 
+#----------------
+def generate_interpretation(pred, confidence, abnormal_flag, score, boxes):
+    
+    interpretation = ""
+
+    # Case 1: Normal but abnormal regions
+    if pred == 0 and abnormal_flag:
+        interpretation = (
+            "The model predicts a normal condition, but some regions show unusual patterns. "
+            "This could be due to noise or early-stage abnormalities. Further review is recommended."
+        )
+
+    # Case 2: Pneumonia / COVID detected
+    elif pred != 0:
+        if score > 0.3:
+            interpretation = (
+                "The highlighted regions show strong patterns associated with lung infection. "
+                "These areas may indicate inflammation or fluid accumulation."
+            )
+        else:
+            interpretation = (
+                "The model detected signs of disease, but the affected regions are not very strong. "
+                "This could indicate mild or early-stage infection."
+            )
+
+    # Case 3: Normal + no abnormality
+    else:
+        interpretation = (
+            "No significant abnormal patterns detected. The lungs appear clear in the analyzed image."
+        )
+
+    return interpretation
+
+
+
 # =========================
-# PREDICT FUNCTION
+# PREDICTION
 # =========================
 def predict(image):
     img = transform(image).unsqueeze(0)
-    
+
     with torch.no_grad():
         outputs = model(img)
         probs = torch.softmax(outputs, dim=1)
@@ -71,11 +92,11 @@ def predict(image):
     return pred.item(), confidence.item(), probs.numpy()
 
 # =========================
-# GRAD-CAM FUNCTION 🔥
+# GRAD-CAM + LOCALIZATION
 # =========================
 def generate_gradcam(image):
     model.eval()
-    
+
     img = transform(image).unsqueeze(0)
     img.requires_grad = True
 
@@ -88,7 +109,6 @@ def generate_gradcam(image):
     def backward_hook(module, grad_in, grad_out):
         gradients.append(grad_out[0])
 
-    # Hook last conv layer
     target_layer = model.features[-1]
     target_layer.register_forward_hook(forward_hook)
     target_layer.register_backward_hook(backward_hook)
@@ -111,12 +131,51 @@ def generate_gradcam(image):
     cam = cam.detach().numpy()
     cam = cv2.resize(cam, (224,224))
 
-    img_np = np.array(image.resize((224,224)))
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    # ===== REGION EXTRACTION =====
+    heatmap_uint8 = np.uint8(255 * cam)
+    _, binary = cv2.threshold(heatmap_uint8, 120, 255, cv2.THRESH_BINARY)
 
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w * h > 500:
+            boxes.append((x, y, w, h))
+
+    # ===== OVERLAY =====
+    img_np = np.array(image.resize((224,224)))
+    heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
     overlay = cv2.addWeighted(img_np, 0.6, heatmap, 0.4, 0)
 
-    return overlay
+    for (x, y, w, h) in boxes:
+        cv2.rectangle(overlay, (x, y), (x+w, y+h), (0,255,0), 2)
+
+    return cam, overlay, boxes
+
+# =========================
+# ABNORMALITY
+# =========================
+def get_abnormality(cam, boxes):
+    score = np.mean(cam)
+
+    abnormal_flag = False
+    if score > 0.2 or len(boxes) > 0:
+        abnormal_flag = True
+
+    return abnormal_flag, score
+
+# =========================
+# FINAL DECISION
+# =========================
+def final_decision(pred, confidence, abnormal_flag):
+    if pred == 0 and abnormal_flag:
+        return "⚠️ Review Required"
+
+    if pred != 0 and confidence < 0.6:
+        return "⚠️ Low Confidence - Verify"
+
+    return "✅ Reliable Prediction"
 
 # =========================
 # UI
@@ -124,7 +183,6 @@ def generate_gradcam(image):
 st.title("🩺 MediSight AI - Advanced Dashboard")
 st.markdown("Upload chest X-ray images for diagnosis")
 
-# MULTI IMAGE UPLOAD
 uploaded_files = st.file_uploader("Upload Images", type=["jpg","png"], accept_multiple_files=True)
 
 if uploaded_files:
@@ -133,12 +191,15 @@ if uploaded_files:
 
         col1, col2, col3 = st.columns(3)
 
+        # ORIGINAL
         with col1:
-            st.image(image, caption="Original", use_container_width=True)
+            st.image(image, caption="Original", width=300)
 
         if st.button(f"Analyze {uploaded_file.name}"):
+
             pred, confidence, probs = predict(image)
 
+            # PREDICTION PANEL
             with col2:
                 st.subheader("Prediction")
 
@@ -156,23 +217,30 @@ if uploaded_files:
                     st.write(cls)
                     st.progress(float(probs[0][i]))
 
-            # GRAD-CAM
-            # GRAD-CAM
+            # GRAD-CAM + ANALYSIS
             with col3:
-                heatmap = generate_gradcam(image)
-                st.image(heatmap, caption="🔥 AI Attention Heatmap", use_container_width=True)
-                st.markdown("### 🧠 Heatmap Explanation")
-                st.info("""
-                        🔴 **Red / Yellow Areas** → Regions where the AI is focusing more  
-                        🟢 **Green Areas** → Moderate attention  
-                        🔵 **Blue Areas** → Low or no attention  
-                        The highlighted regions indicate **important lung areas** that influenced the AI’s prediction.
-                        """)
-                st.warning("""
-                           ⚠️ Note: This is an AI-assisted visualization and should be interpreted by medical professionals.
-                           """)
-         
-           
+                cam, heatmap, boxes = generate_gradcam(image)
+                abnormal_flag, score = get_abnormality(cam, boxes)
+
+                st.image(heatmap, caption="🔥 AI Localization (Pseudo)", width=300)
+
+                st.markdown("### 🧠 Abnormality Analysis")
+
+                if abnormal_flag:
+                    st.error("⚠️ Abnormal Regions Detected")
+                else:
+                    st.success("✅ No Significant Abnormality")
+
+                st.metric("Abnormality Score", f"{score:.3f}")
+                st.write(f"Detected Regions: {len(boxes)}")
+
+                decision = final_decision(pred, confidence, abnormal_flag)
+                st.info(f"Final Decision: {decision}")
+                interpretation = generate_interpretation(pred, confidence, abnormal_flag, score, boxes)
+                st.markdown("### 📊 Interpretation")
+
+                st.write(interpretation)
+                st.warning("⚠️ AI assistance only. Not a medical diagnosis.")
 
 st.markdown("---")
 st.markdown("🔬 AI-powered medical assistant")
